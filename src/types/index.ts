@@ -75,6 +75,7 @@ export interface PredictionRecord {
   didPriceRise?: boolean;
   evaluated?: boolean;
   correct?: boolean;
+  isTie?: boolean;
 }
 
 export interface Config {

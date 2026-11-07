@@ -8,6 +8,7 @@ export interface StepExecutionResult {
   updatedLots: Lot[];
   newLogs: LogEntry[];
   newPrediction?: PredictionRecord;
+  updatedPredictions: PredictionRecord[];
   guardrailTriggered: boolean;
   guardrailReason?: string;
   actionTaken: 'buy' | 'sell_target' | 'sell_stop' | 'sell_signal' | 'sell_guardrail' | 'wait' | 'guardrail_halt';
@@ -23,7 +24,8 @@ export async function processStep({
   config,
   predictions,
   sessionId,
-  lastBuyStepIndex
+  lastBuyStepIndex,
+  initialSessionPrice
 }: {
   stepIndex: number;
   candles: Candle[];
@@ -35,6 +37,7 @@ export async function processStep({
   predictions: PredictionRecord[];
   sessionId: string;
   lastBuyStepIndex: number;
+  initialSessionPrice: Decimal;
 }): Promise<StepExecutionResult> {
   const currentCandle = candles[currentCandleIndex];
   const currentPrice = currentCandle.close;
@@ -45,14 +48,14 @@ export async function processStep({
   let guardrailTriggered = false;
   let guardrailReason: string | undefined;
 
-  // 1. Check General Guardrail
+  // 1. Check General Guardrail using initial session price (after warm-up)
   const { netWorthBRL } = calculateNetWorth({
     cashBRL: updatedWallet.cashBRL,
     coinQuantity: updatedWallet.coinQuantity,
     currentPrice
   });
 
-  const initialNetWorth = updatedWallet.initialCapitalBRL.plus(updatedWallet.initialCoinQuantity.mul(candles[0]?.close || currentPrice));
+  const initialNetWorth = updatedWallet.initialCapitalBRL.plus(updatedWallet.initialCoinQuantity.mul(initialSessionPrice));
   const dropPercent = initialNetWorth.isZero() ? new Decimal(0) : initialNetWorth.minus(netWorthBRL).div(initialNetWorth).mul(100);
 
   if (dropPercent.gte(config.generalGuardrailPercent)) {
@@ -68,7 +71,6 @@ export async function processStep({
     });
 
     if (config.guardrailAction === 'sell_all') {
-      // Liquidate all open lots at current price
       for (const lot of openLots) {
         if (lot.status === 'open') {
           const sellRes = calculateSellOrder({
@@ -94,6 +96,7 @@ export async function processStep({
       updatedWallet,
       updatedLots,
       newLogs,
+      updatedPredictions: predictions,
       guardrailTriggered: true,
       guardrailReason,
       actionTaken: 'guardrail_halt'
@@ -108,22 +111,18 @@ export async function processStep({
     let sellPriceAt = currentPrice;
     let newStatus: Lot['status'] = 'sold_target';
 
-    // Check if high reached target price
     if (currentCandle.high.gte(lot.targetPrice)) {
       hitTarget = true;
       sellPriceAt = lot.targetPrice;
       newStatus = 'sold_target';
     }
 
-    // Check if low reached stop loss price
     if (lot.stopLossPrice && currentCandle.low.lte(lot.stopLossPrice)) {
       hitStop = true;
-      // Conservative: if open opened below stop loss, sell at open
       sellPriceAt = currentCandle.open.lt(lot.stopLossPrice) ? currentCandle.open : lot.stopLossPrice;
       newStatus = 'sold_stop';
     }
 
-    // If both hit in the same candle, stop loss wins (conservative scenario)
     if (hitTarget && hitStop) {
       hitTarget = false;
       newStatus = 'sold_stop';
@@ -161,7 +160,32 @@ export async function processStep({
     }
   }
 
-  // 3. Check if candle is noTrade
+  // 3. Evaluate predictions at every step (Checking if H candles passed)
+  const evaluatedPredictions = predictions.map(p => {
+    if (!p.evaluated && currentCandleIndex >= p.stepIndex + p.horizon) {
+      const futureCandle = candles[p.stepIndex + p.horizon];
+      if (futureCandle) {
+        const diff = futureCandle.close.minus(p.priceAtPrediction);
+        const predictedHigh = p.probabilidadeAlta >= 50;
+        let isTie = diff.isZero();
+        let correct = false;
+        if (!isTie) {
+          const didRise = diff.gt(0);
+          correct = predictedHigh === didRise;
+        }
+        return {
+          ...p,
+          actualPrice: futureCandle.close,
+          didPriceRise: diff.gt(0),
+          evaluated: true,
+          correct,
+          isTie
+        };
+      }
+    }
+    return p;
+  });
+
   if (currentCandle.isNoTrade) {
     newLogs.push({
       id: `log_${Date.now()}_${Math.random()}`,
@@ -174,6 +198,7 @@ export async function processStep({
       updatedWallet,
       updatedLots,
       newLogs,
+      updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
       actionTaken: 'wait'
     };
@@ -188,6 +213,7 @@ export async function processStep({
       updatedWallet,
       updatedLots,
       newLogs,
+      updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
       actionTaken: 'wait'
     };
@@ -214,6 +240,7 @@ export async function processStep({
       updatedWallet,
       updatedLots,
       newLogs,
+      updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
       actionTaken: 'wait'
     };
@@ -234,24 +261,21 @@ export async function processStep({
     evaluated: false
   };
 
-  const timeStr = new Date(currentCandle.timestamp).toLocaleTimeString();
+  const allPredsWithNew = [...evaluatedPredictions, predRecord];
 
-  // 6. Apply Buy / Sell Signal rules
+  const timeStr = new Date(currentCandle.timestamp).toLocaleTimeString();
   const activeOpenLotsCount = updatedLots.filter(l => l.status === 'open').length;
   const cooldownElapsed = stepIndex - lastBuyStepIndex >= config.cooldownSteps;
   const underMaxLots = activeOpenLotsCount < config.maxActiveLots;
   const underMaxTrades = updatedWallet.totalTrades < config.maxDailyTrades;
 
-  // Determine amount to spend
   let amountToSpend = new Decimal(0);
   if (config.buySizeMode === 'fixed') {
     amountToSpend = new Decimal(config.buySizeValue);
   } else {
-    // percent of cash
     amountToSpend = updatedWallet.cashBRL.mul(config.buySizeValue).div(100);
   }
 
-  // Check minimum order value
   if (amountToSpend.lt(config.minOrderValueBRL)) {
     amountToSpend = new Decimal(config.minOrderValueBRL);
   }
@@ -263,19 +287,6 @@ export async function processStep({
     underMaxTrades &&
     cooldownElapsed
   ) {
-    // Check net profit guarantee: target gain must cover roundtrip fees
-    const feeRate = new Decimal(config.feePercent).div(100);
-    const estimatedRoundtripFeePercent = feeRate.mul(2).mul(100);
-    if (config.gainTargetPercent <= estimatedRoundtripFeePercent.toNumber()) {
-      newLogs.push({
-        id: `log_${Date.now()}_${Math.random()}`,
-        timestamp: Date.now(),
-        stepIndex,
-        type: 'warning',
-        message: `${timeStr} — Alerta: Meta de ganho (${config.gainTargetPercent}%) menor ou igual às taxas estimadas (~${estimatedRoundtripFeePercent.toDecimalPlaces(2)}%).`
-      });
-    }
-
     const buyRes = calculateBuyOrder({
       cashBRL: updatedWallet.cashBRL,
       amountToSpendBRL: amountToSpend,
@@ -292,6 +303,7 @@ export async function processStep({
       updatedWallet.cashBRL = buyRes.newCashBRL!;
       updatedWallet.coinQuantity = updatedWallet.coinQuantity.plus(buyRes.lot.quantity);
       updatedWallet.totalFeesPaidBRL = updatedWallet.totalFeesPaidBRL.plus(buyRes.feePaidBRL!);
+      updatedWallet.totalTrades += 1;
       updatedLots.push(buyRes.lot);
       actionTaken = 'buy';
 
@@ -304,7 +316,6 @@ export async function processStep({
       });
     }
   } else if (probabilidadeQueda >= config.sellThreshold && config.fallPolicy !== 'ignore') {
-    // Fall signal triggered
     actionTaken = 'sell_signal';
     const lotsToSell = updatedLots.filter(l => {
       if (l.status !== 'open') return false;
@@ -358,6 +369,7 @@ export async function processStep({
     updatedLots,
     newLogs,
     newPrediction: predRecord,
+    updatedPredictions: allPredsWithNew,
     guardrailTriggered: false,
     actionTaken
   };

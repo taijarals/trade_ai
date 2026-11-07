@@ -6,18 +6,35 @@ export const DiagnosticsPanel: React.FC = () => {
   const [selectedMarket, setSelectedMarket] = useState('xrpbrl');
   const [loading, setLoading] = useState(false);
   const [rawTicker, setRawTicker] = useState<any>(null);
-  const [rawCandles, setRawCandles] = useState<any>(null);
+  const [tickerUrl, setTickerUrl] = useState<string>('');
+  const [candlesResult, setCandlesResult] = useState<{ url: string; raw: any; first: any; last: any } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const runDiagnostics = async () => {
     setLoading(true);
     setError(null);
     try {
-      const ticker = await fetchFoxbitRaw(`markets/${selectedMarket}/ticker/24hr`);
-      setRawTicker(ticker);
+      const tickerRes = await fetchFoxbitRaw(`markets/${selectedMarket}/ticker/24hr`);
+      setRawTicker(tickerRes.data);
+      setTickerUrl(tickerRes.url);
 
-      const candles = await fetchCandlesticks(selectedMarket, '1h', undefined, undefined, 5);
-      setRawCandles(candles);
+      const res = await fetchCandlesticks(selectedMarket, '1h', undefined, undefined, 10);
+      if (res.candles.length > 0) {
+        const first = res.candles[0];
+        const last = res.candles[res.candles.length - 1];
+        setCandlesResult({
+          url: res.urlCalled,
+          raw: res.rawResponse,
+          first: {
+            ...first,
+            brasiliaTime: new Date(first.timestamp).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
+          },
+          last: {
+            ...last,
+            brasiliaTime: new Date(last.timestamp).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
+          }
+        });
+      }
     } catch (err: any) {
       setError(err.message || 'Erro ao consultar API da Foxbit.');
     } finally {
@@ -35,7 +52,7 @@ export const DiagnosticsPanel: React.FC = () => {
             </div>
             <div>
               <h2 className="text-lg font-bold text-slate-900 dark:text-white">Diagnóstico da API Foxbit</h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400">Valide a conectividade e visualize as respostas brutas da exchange em tempo real.</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">URL chamada, resposta bruta e candles convertidos com horário de Brasília.</p>
             </div>
           </div>
 
@@ -69,25 +86,31 @@ export const DiagnosticsPanel: React.FC = () => {
         )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Ticker Raw */}
+          {/* Ticker Raw & URL */}
           <div className="space-y-2">
             <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-              Ticker 24hr (Resposta Bruta)
+              Ticker 24hr (URL & Resposta)
             </h3>
-            <pre className="bg-slate-950 text-emerald-400 p-4 rounded-xl text-xs font-mono overflow-auto max-h-96 border border-slate-800">
+            <div className="text-xs text-indigo-400 font-mono bg-slate-900 p-2 rounded-lg border border-slate-800">
+              URL: {tickerUrl || 'N/A'}
+            </div>
+            <pre className="bg-slate-950 text-emerald-400 p-4 rounded-xl text-xs font-mono overflow-auto max-h-80 border border-slate-800">
               {rawTicker ? JSON.stringify(rawTicker, null, 2) : 'Clique em "Testar Conexão" para carregar.'}
             </pre>
           </div>
 
-          {/* Candlesticks Raw */}
+          {/* Candlesticks Converted & Raw */}
           <div className="space-y-2">
             <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-              Candlesticks (Últimos 5 candles)
+              Candlesticks (URL, Primeiro & Último Convertidos)
             </h3>
-            <pre className="bg-slate-950 text-emerald-400 p-4 rounded-xl text-xs font-mono overflow-auto max-h-96 border border-slate-800">
-              {rawCandles ? JSON.stringify(rawCandles, null, 2) : 'Clique em "Testar Conexão" para carregar.'}
+            <div className="text-xs text-indigo-400 font-mono bg-slate-900 p-2 rounded-lg border border-slate-800">
+              URL: {candlesResult?.url || 'N/A'}
+            </div>
+            <pre className="bg-slate-950 text-emerald-400 p-4 rounded-xl text-xs font-mono overflow-auto max-h-80 border border-slate-800">
+              {candlesResult ? JSON.stringify({ firstCandle: candlesResult.first, lastCandle: candlesResult.last }, null, 2) : 'Clique em "Testar Conexão" para carregar.'}
             </pre>
           </div>
         </div>

@@ -10,7 +10,7 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { ComparisonModal } from './components/ComparisonModal';
 import { Config, Candle, WalletState, Lot, PredictionRecord, LogEntry, SessionRecord } from './types';
 import { DEFAULT_CONFIG, saveSession, savePredictions } from './services/storage';
-import { fetchCandlesticks } from './services/foxbit';
+import { fetchCandlesticks, parseIntervalToMs } from './services/foxbit';
 import { processStep } from './utils/engine';
 
 export default function App() {
@@ -33,8 +33,12 @@ export default function App() {
   const [lastBuyStepIndex, setLastBuyStepIndex] = useState(-999);
   const [sessionId, setSessionId] = useState(`session_${Date.now()}`);
   const [comparedSessions, setComparedSessions] = useState<SessionRecord[] | null>(null);
+  const [initialSessionPrice, setInitialSessionPrice] = useState<Decimal>(new Decimal(0));
+  const [lastTradeCalendarDay, setLastTradeCalendarDay] = useState<string>('');
 
-  const timerRef = useRef<any>(null);
+  const processingRef = useRef(false);
+  const isRunningRef = useRef(false);
+  isRunningRef.current = isRunning;
 
   // Load candles when market or date changes in replay mode
   useEffect(() => {
@@ -46,7 +50,6 @@ export default function App() {
   const loadReplayCandles = async () => {
     try {
       setIsRunning(false);
-      // Parse date and time window
       const dateParts = config.replayDate.split('-').map(Number);
       const startParts = config.replayStartTime.split(':').map(Number);
       const endParts = config.replayEndTime.split(':').map(Number);
@@ -54,23 +57,28 @@ export default function App() {
       const startDate = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], startParts[0] || 8, startParts[1] || 0);
       const endDate = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], endParts[0] || 18, endParts[1] || 0);
 
-      // Add warm-up period (e.g. 50 candles before start)
-      const warmupTimeMs = startDate.getTime() - (config.candleWindowSize * 3600000);
+      // Real warm-up duration calculation: candleWindowSize * intervalMs
+      const intervalMs = parseIntervalToMs(config.resolution);
+      const warmupTimeMs = startDate.getTime() - (config.candleWindowSize * intervalMs);
 
-      const fetched = await fetchCandlesticks(
+      const res = await fetchCandlesticks(
         config.market,
         config.resolution,
         warmupTimeMs,
         endDate.getTime(),
-        500
+        1000
       );
 
-      // Filter candles within range or starting from warmup
+      const fetched = res.candles;
+      if (fetched.length === 0) {
+        throw new Error('Nenhum candle retornado para o período selecionado.');
+      }
+
       setCandles(fetched);
-      // Find index corresponding to startDate
       const startIndex = fetched.findIndex(c => c.timestamp >= startDate.getTime());
       const initialIdx = startIndex !== -1 ? startIndex : Math.min(config.candleWindowSize, fetched.length - 1);
       setCurrentCandleIndex(initialIdx);
+      setInitialSessionPrice(fetched[initialIdx]?.close || fetched[0].close);
 
       // Reset wallet
       const initBRL = new Decimal(config.initialCapitalBRL);
@@ -93,12 +101,24 @@ export default function App() {
         message: `Replay carregado com sucesso: ${fetched.length} candles obtidos da Foxbit.`
       }]);
       setSessionId(`session_${Date.now()}`);
+      setLastTradeCalendarDay('');
     } catch (err: any) {
       alert(`Erro ao carregar dados da Foxbit: ${err.message}`);
     }
   };
 
+  const validateGainTargetBeforeStart = (): boolean => {
+    // Check if gain target is <= buy fee + sell fee + slippage * 2
+    const totalCostPercent = (config.feePercent * 2) + (config.slippagePercent * 2);
+    if (config.gainTargetPercent <= totalCostPercent) {
+      alert(`Erro de Configuração: A meta de ganho (${config.gainTargetPercent}%) é menor ou igual à soma das taxas e slippage estimados (${totalCostPercent.toFixed(2)}%). Ajuste a meta de ganho nas configurações antes de iniciar.`);
+      return false;
+    }
+    return true;
+  };
+
   const handleStart = () => {
+    if (!validateGainTargetBeforeStart()) return;
     if (candles.length === 0) {
       alert('Nenhum candle carregado para simulação.');
       return;
@@ -108,20 +128,26 @@ export default function App() {
 
   const handlePause = () => {
     setIsRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
   };
 
   const handleStop = async () => {
     handlePause();
-    // Save session record
     await saveCurrentSession('stopped');
     alert('Simulação parada e salva no histórico.');
   };
 
   const saveCurrentSession = async (status: SessionRecord['status']) => {
+    // Mark predictions of the last H steps as unevaluated
+    const finalPredictions = predictions.map(p => {
+      if (currentCandleIndex < p.stepIndex + p.horizon) {
+        return { ...p, evaluated: false };
+      }
+      return p;
+    });
+
     const finalPrice = candles[currentCandleIndex]?.close || new Decimal(0);
     const finalNetWorth = wallet.cashBRL.plus(wallet.coinQuantity.mul(finalPrice));
-    const initialNetWorth = wallet.initialCapitalBRL.plus(wallet.initialCoinQuantity.mul(candles[0]?.close || finalPrice));
+    const initialNetWorth = wallet.initialCapitalBRL.plus(wallet.initialCoinQuantity.mul(initialSessionPrice));
     const returnBRL = finalNetWorth.minus(initialNetWorth);
     const returnPercent = initialNetWorth.isZero() ? new Decimal(0) : returnBRL.div(initialNetWorth).mul(100);
 
@@ -144,100 +170,101 @@ export default function App() {
       totalReturnPercent: returnPercent.toString(),
       buyAndHoldReturnPercent: buyAndHoldReturn.toString(),
       totalFeesBRL: wallet.totalFeesPaidBRL.toString(),
-      aiCallsCount: predictions.length,
+      aiCallsCount: finalPredictions.length,
       totalTrades: wallet.totalTrades,
       winningTrades: winningLots,
       losingTrades: losingLots,
       lots: allLots,
-      predictions,
+      predictions: finalPredictions,
       netWorthHistory: [],
       logs,
       notes: ''
     };
 
     await saveSession(sessionRecord);
-    await savePredictions(predictions);
+    await savePredictions(finalPredictions);
   };
 
   const executeStep = async () => {
-    if (currentCandleIndex >= candles.length - 1) {
-      handlePause();
-      await saveCurrentSession('completed');
-      alert('Simulação concluída até o fim dos candles disponíveis!');
-      return;
-    }
+    if (processingRef.current) return;
+    processingRef.current = true;
 
-    const nextIndex = currentCandleIndex + 1;
-    setCurrentCandleIndex(nextIndex);
+    try {
+      if (currentCandleIndex >= candles.length - 1) {
+        setIsRunning(false);
+        await saveCurrentSession('completed');
+        alert('Simulação concluída até o fim dos candles disponíveis!');
+        processingRef.current = false;
+        return;
+      }
 
-    const openLotsList = allLots.filter(l => l.status === 'open');
+      const nextIndex = currentCandleIndex + 1;
+      const currentCandle = candles[nextIndex];
+      const candleCalendarDay = new Date(currentCandle.timestamp).toISOString().split('T')[0];
 
-    const result = await processStep({
-      stepIndex: nextIndex,
-      candles,
-      currentCandleIndex: nextIndex,
-      wallet,
-      openLots: openLotsList,
-      allLots,
-      config,
-      predictions,
-      sessionId,
-      lastBuyStepIndex
-    });
+      // Reset daily trades if calendar day changed
+      let currentWallet = { ...wallet };
+      if (lastTradeCalendarDay && lastTradeCalendarDay !== candleCalendarDay) {
+        currentWallet.totalTrades = 0;
+      }
+      setLastTradeCalendarDay(candleCalendarDay);
 
-    setWallet(result.updatedWallet);
-    setAllLots(result.updatedLots);
-    setLogs(prev => [...prev, ...result.newLogs]);
+      setCurrentCandleIndex(nextIndex);
+      const openLotsList = allLots.filter(l => l.status === 'open');
 
-    if (result.actionTaken === 'buy') {
-      setLastBuyStepIndex(nextIndex);
-    }
-
-    if (result.newPrediction) {
-      const updatedPreds = [...predictions, result.newPrediction];
-      // Evaluate past predictions where horizon H has passed
-      const evaluated = updatedPreds.map(p => {
-        if (!p.evaluated && nextIndex >= p.stepIndex + p.horizon) {
-          const futureCandle = candles[p.stepIndex + p.horizon];
-          if (futureCandle) {
-            const didRise = futureCandle.close.gt(p.priceAtPrediction);
-            const predictedHigh = p.probabilidadeAlta >= 50;
-            return {
-              ...p,
-              actualPrice: futureCandle.close,
-              didPriceRise: didRise,
-              evaluated: true,
-              correct: predictedHigh === didRise
-            };
-          }
-        }
-        return p;
+      const result = await processStep({
+        stepIndex: nextIndex,
+        candles,
+        currentCandleIndex: nextIndex,
+        wallet: currentWallet,
+        openLots: openLotsList,
+        allLots,
+        config,
+        predictions,
+        sessionId,
+        lastBuyStepIndex,
+        initialSessionPrice
       });
-      setPredictions(evaluated);
-    }
 
-    if (result.guardrailTriggered) {
-      handlePause();
-      await saveCurrentSession('guardrail_triggered');
-      alert(result.guardrailReason || 'Trava geral acionada.');
+      setWallet(result.updatedWallet);
+      setAllLots(result.updatedLots);
+      setLogs(prev => [...prev, ...result.newLogs]);
+      setPredictions(result.updatedPredictions);
+
+      if (result.actionTaken === 'buy') {
+        setLastBuyStepIndex(nextIndex);
+      }
+
+      if (result.guardrailTriggered) {
+        setIsRunning(false);
+        await saveCurrentSession('guardrail_triggered');
+        alert(result.guardrailReason || 'Trava geral acionada.');
+      }
+    } finally {
+      processingRef.current = false;
     }
   };
 
-  // Replay timer effect
+  // Replay async loop with processing lock
   useEffect(() => {
-    if (isRunning && config.mode === 'replay') {
-      timerRef.current = setTimeout(() => {
-        executeSpeedStep();
-      }, config.replayDelayMs);
-    }
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
+    let active = true;
+    const runLoop = async () => {
+      while (isRunningRef.current && active) {
+        await executeStep();
+        if (isRunningRef.current && active) {
+          await new Promise(r => setTimeout(r, config.replayDelayMs));
+        }
+      }
     };
-  }, [isRunning, currentCandleIndex, candles]);
 
-  const executeSpeedStep = async () => {
-    await executeStep();
-  };
+    if (isRunning) {
+      runLoop();
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [isRunning, currentCandleIndex]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
