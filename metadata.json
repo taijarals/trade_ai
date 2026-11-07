@@ -1,0 +1,6 @@
+{
+  "name": "Robô de Tendência — Laboratório",
+  "description": "Laboratório de paper trading de criptomoedas com simulação de estratégias guiadas por IA e preços reais da Foxbit.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
