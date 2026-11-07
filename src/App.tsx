@@ -17,24 +17,44 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('lab');
   const [config, setConfig] = useState<Config>(DEFAULT_CONFIG);
   const [isRunning, setIsRunning] = useState(false);
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [currentCandleIndex, setCurrentCandleIndex] = useState(0);
-  const [wallet, setWallet] = useState<WalletState>({
-    cashBRL: new Decimal(DEFAULT_CONFIG.initialCapitalBRL),
-    coinQuantity: new Decimal(DEFAULT_CONFIG.initialCoins),
-    initialCapitalBRL: new Decimal(DEFAULT_CONFIG.initialCapitalBRL),
-    initialCoinQuantity: new Decimal(DEFAULT_CONFIG.initialCoins),
-    totalFeesPaidBRL: new Decimal(0),
-    totalTrades: 0
-  });
-  const [allLots, setAllLots] = useState<Lot[]>([]);
-  const [predictions, setPredictions] = useState<PredictionRecord[]>([]);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [lastBuyStepIndex, setLastBuyStepIndex] = useState(-999);
-  const [sessionId, setSessionId] = useState(`session_${Date.now()}`);
+  const [tick, setTick] = useState(0); // force render trigger
   const [comparedSessions, setComparedSessions] = useState<SessionRecord[] | null>(null);
-  const [initialSessionPrice, setInitialSessionPrice] = useState<Decimal>(new Decimal(0));
-  const [lastTradeCalendarDay, setLastTradeCalendarDay] = useState<string>('');
+
+  // Mandatory simRef holding ALL simulation state
+  const simRef = useRef<{
+    candles: Candle[];
+    currentCandleIndex: number;
+    wallet: WalletState;
+    allLots: Lot[];
+    predictions: PredictionRecord[];
+    logs: LogEntry[];
+    lastBuyStepIndex: number;
+    dailyTrades: number;
+    lastTradeCalendarDay: string;
+    initialSessionPrice: Decimal;
+    sessionId: string;
+    startDateMs: number;
+  }>({
+    candles: [],
+    currentCandleIndex: 0,
+    wallet: {
+      cashBRL: new Decimal(DEFAULT_CONFIG.initialCapitalBRL),
+      coinQuantity: new Decimal(DEFAULT_CONFIG.initialCoins),
+      initialCapitalBRL: new Decimal(DEFAULT_CONFIG.initialCapitalBRL),
+      initialCoinQuantity: new Decimal(DEFAULT_CONFIG.initialCoins),
+      totalFeesPaidBRL: new Decimal(0),
+      totalTrades: 0
+    },
+    allLots: [],
+    predictions: [],
+    logs: [],
+    lastBuyStepIndex: -999,
+    dailyTrades: 0,
+    lastTradeCalendarDay: '',
+    initialSessionPrice: new Decimal(0),
+    sessionId: `session_${Date.now()}`,
+    startDateMs: Date.now()
+  });
 
   const processingRef = useRef(false);
   const isRunningRef = useRef(false);
@@ -57,7 +77,6 @@ export default function App() {
       const startDate = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], startParts[0] || 8, startParts[1] || 0);
       const endDate = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], endParts[0] || 18, endParts[1] || 0);
 
-      // Real warm-up duration calculation: candleWindowSize * intervalMs
       const intervalMs = parseIntervalToMs(config.resolution);
       const warmupTimeMs = startDate.getTime() - (config.candleWindowSize * intervalMs);
 
@@ -74,41 +93,51 @@ export default function App() {
         throw new Error('Nenhum candle retornado para o período selecionado.');
       }
 
-      setCandles(fetched);
       const startIndex = fetched.findIndex(c => c.timestamp >= startDate.getTime());
       const initialIdx = startIndex !== -1 ? startIndex : Math.min(config.candleWindowSize, fetched.length - 1);
-      setCurrentCandleIndex(initialIdx);
-      setInitialSessionPrice(fetched[initialIdx]?.close || fetched[0].close);
 
-      // Reset wallet
+      // Count warmup vs day window candles
+      const warmupCandlesCount = fetched.slice(0, initialIdx).length;
+      const dayWindowCandlesCount = fetched.slice(initialIdx).length;
+
       const initBRL = new Decimal(config.initialCapitalBRL);
       const initCoins = new Decimal(config.initialCoins);
-      setWallet({
-        cashBRL: initBRL,
-        coinQuantity: initCoins,
-        initialCapitalBRL: initBRL,
-        initialCoinQuantity: initCoins,
-        totalFeesPaidBRL: new Decimal(0),
-        totalTrades: 0
-      });
-      setAllLots([]);
-      setPredictions([]);
-      setLogs([{
-        id: `log_${Date.now()}`,
-        timestamp: Date.now(),
-        stepIndex: 0,
-        type: 'info',
-        message: `Replay carregado com sucesso: ${fetched.length} candles obtidos da Foxbit.`
-      }]);
-      setSessionId(`session_${Date.now()}`);
-      setLastTradeCalendarDay('');
+
+      simRef.current = {
+        candles: fetched,
+        currentCandleIndex: initialIdx,
+        wallet: {
+          cashBRL: initBRL,
+          coinQuantity: initCoins,
+          initialCapitalBRL: initBRL,
+          initialCoinQuantity: initCoins,
+          totalFeesPaidBRL: new Decimal(0),
+          totalTrades: 0
+        },
+        allLots: [],
+        predictions: [],
+        logs: [{
+          id: `log_${Date.now()}`,
+          timestamp: Date.now(),
+          stepIndex: 0,
+          type: 'info',
+          message: `Replay carregado: ${warmupCandlesCount} candles no aquecimento, ${dayWindowCandlesCount} candles na janela do dia.`
+        }],
+        lastBuyStepIndex: -999,
+        dailyTrades: 0,
+        lastTradeCalendarDay: '',
+        initialSessionPrice: fetched[initialIdx]?.close || fetched[0].close,
+        sessionId: `session_${Date.now()}`,
+        startDateMs: startDate.getTime()
+      };
+
+      setTick(t => t + 1);
     } catch (err: any) {
       alert(`Erro ao carregar dados da Foxbit: ${err.message}`);
     }
   };
 
   const validateGainTargetBeforeStart = (): boolean => {
-    // Check if gain target is <= buy fee + sell fee + slippage * 2
     const totalCostPercent = (config.feePercent * 2) + (config.slippagePercent * 2);
     if (config.gainTargetPercent <= totalCostPercent) {
       alert(`Erro de Configuração: A meta de ganho (${config.gainTargetPercent}%) é menor ou igual à soma das taxas e slippage estimados (${totalCostPercent.toFixed(2)}%). Ajuste a meta de ganho nas configurações antes de iniciar.`);
@@ -119,7 +148,7 @@ export default function App() {
 
   const handleStart = () => {
     if (!validateGainTargetBeforeStart()) return;
-    if (candles.length === 0) {
+    if (simRef.current.candles.length === 0) {
       alert('Nenhum candle carregado para simulação.');
       return;
     }
@@ -137,29 +166,29 @@ export default function App() {
   };
 
   const saveCurrentSession = async (status: SessionRecord['status']) => {
-    // Mark predictions of the last H steps as unevaluated
-    const finalPredictions = predictions.map(p => {
-      if (currentCandleIndex < p.stepIndex + p.horizon) {
+    const s = simRef.current;
+    const finalPredictions = s.predictions.map(p => {
+      if (s.currentCandleIndex < p.stepIndex + p.horizon) {
         return { ...p, evaluated: false };
       }
       return p;
     });
 
-    const finalPrice = candles[currentCandleIndex]?.close || new Decimal(0);
-    const finalNetWorth = wallet.cashBRL.plus(wallet.coinQuantity.mul(finalPrice));
-    const initialNetWorth = wallet.initialCapitalBRL.plus(wallet.initialCoinQuantity.mul(initialSessionPrice));
+    const finalPrice = s.candles[s.currentCandleIndex]?.close || new Decimal(0);
+    const finalNetWorth = s.wallet.cashBRL.plus(s.wallet.coinQuantity.mul(finalPrice));
+    const initialNetWorth = s.wallet.initialCapitalBRL.plus(s.wallet.initialCoinQuantity.mul(s.initialSessionPrice));
     const returnBRL = finalNetWorth.minus(initialNetWorth);
     const returnPercent = initialNetWorth.isZero() ? new Decimal(0) : returnBRL.div(initialNetWorth).mul(100);
 
-    const initialBuyAndHoldCoins = candles[0] && !candles[0].open.isZero() ? initialNetWorth.div(candles[0].open) : new Decimal(0);
+    const initialBuyAndHoldCoins = s.candles[0] && !s.candles[0].open.isZero() ? initialNetWorth.div(s.candles[0].open) : new Decimal(0);
     const buyAndHoldNetWorth = initialBuyAndHoldCoins.mul(finalPrice);
     const buyAndHoldReturn = initialNetWorth.isZero() ? new Decimal(0) : buyAndHoldNetWorth.minus(initialNetWorth).div(initialNetWorth).mul(100);
 
-    const winningLots = allLots.filter(l => l.netProfitBRL && l.netProfitBRL.gt(0)).length;
-    const losingLots = allLots.filter(l => l.netProfitBRL && l.netProfitBRL.lt(0)).length;
+    const winningLots = s.allLots.filter(l => l.netProfitBRL && l.netProfitBRL.gt(0)).length;
+    const losingLots = s.allLots.filter(l => l.netProfitBRL && l.netProfitBRL.lt(0)).length;
 
     const sessionRecord: SessionRecord = {
-      id: sessionId,
+      id: s.sessionId,
       title: `${config.market.toUpperCase()} — ${new Date().toLocaleDateString()}`,
       createdAt: Date.now(),
       config,
@@ -169,15 +198,15 @@ export default function App() {
       buyAndHoldNetWorthBRL: buyAndHoldNetWorth.toString(),
       totalReturnPercent: returnPercent.toString(),
       buyAndHoldReturnPercent: buyAndHoldReturn.toString(),
-      totalFeesBRL: wallet.totalFeesPaidBRL.toString(),
+      totalFeesBRL: s.wallet.totalFeesPaidBRL.toString(),
       aiCallsCount: finalPredictions.length,
-      totalTrades: wallet.totalTrades,
+      totalTrades: s.wallet.totalTrades,
       winningTrades: winningLots,
       losingTrades: losingLots,
-      lots: allLots,
+      lots: s.allLots,
       predictions: finalPredictions,
       netWorthHistory: [],
-      logs,
+      logs: s.logs,
       notes: ''
     };
 
@@ -190,7 +219,8 @@ export default function App() {
     processingRef.current = true;
 
     try {
-      if (currentCandleIndex >= candles.length - 1) {
+      const s = simRef.current;
+      if (s.currentCandleIndex >= s.candles.length - 1) {
         setIsRunning(false);
         await saveCurrentSession('completed');
         alert('Simulação concluída até o fim dos candles disponíveis!');
@@ -198,41 +228,65 @@ export default function App() {
         return;
       }
 
-      const nextIndex = currentCandleIndex + 1;
-      const currentCandle = candles[nextIndex];
-      const candleCalendarDay = new Date(currentCandle.timestamp).toISOString().split('T')[0];
+      const nextIndex = s.currentCandleIndex + 1;
+      const currentCandle = s.candles[nextIndex];
 
-      // Reset daily trades if calendar day changed
-      let currentWallet = { ...wallet };
-      if (lastTradeCalendarDay && lastTradeCalendarDay !== candleCalendarDay) {
-        currentWallet.totalTrades = 0;
+      // Calendar day in Brasília timezone (America/Sao_Paulo)
+      const brasiliaDateStr = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Sao_Paulo',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(currentCandle.timestamp);
+
+      if (s.lastTradeCalendarDay && s.lastTradeCalendarDay !== brasiliaDateStr) {
+        s.dailyTrades = 0;
       }
-      setLastTradeCalendarDay(candleCalendarDay);
+      s.lastTradeCalendarDay = brasiliaDateStr;
 
-      setCurrentCandleIndex(nextIndex);
-      const openLotsList = allLots.filter(l => l.status === 'open');
+      // Check daily trade limit using separate dailyTrades counter
+      if (s.dailyTrades >= config.maxDailyTrades) {
+        s.logs.push({
+          id: `log_${Date.now()}_${Math.random()}`,
+          timestamp: Date.now(),
+          stepIndex: nextIndex,
+          type: 'warning',
+          message: `${new Date(currentCandle.timestamp).toLocaleTimeString()} — Limite diário de operações atingido (${s.dailyTrades}/${config.maxDailyTrades}).`
+        });
+        s.currentCandleIndex = nextIndex;
+        setTick(t => t + 1);
+        processingRef.current = false;
+        return;
+      }
+
+      const openLotsList = s.allLots.filter(l => l.status === 'open');
 
       const result = await processStep({
         stepIndex: nextIndex,
-        candles,
+        candles: s.candles,
         currentCandleIndex: nextIndex,
-        wallet: currentWallet,
+        wallet: s.wallet,
         openLots: openLotsList,
-        allLots,
+        allLots: s.allLots,
         config,
-        predictions,
-        sessionId,
-        lastBuyStepIndex,
-        initialSessionPrice
+        predictions: s.predictions,
+        sessionId: s.sessionId,
+        lastBuyStepIndex: s.lastBuyStepIndex,
+        initialSessionPrice: s.initialSessionPrice
       });
 
-      setWallet(result.updatedWallet);
-      setAllLots(result.updatedLots);
-      setLogs(prev => [...prev, ...result.newLogs]);
-      setPredictions(result.updatedPredictions);
+      // Update simRef ONLY after processStep completes
+      s.wallet = result.updatedWallet;
+      s.allLots = result.updatedLots;
+      s.logs = [...s.logs, ...result.newLogs];
+      s.predictions = result.updatedPredictions;
+      s.currentCandleIndex = nextIndex;
 
       if (result.actionTaken === 'buy') {
-        setLastBuyStepIndex(nextIndex);
+        s.lastBuyStepIndex = nextIndex;
+        s.dailyTrades += 1;
+      } else if (result.actionTaken === 'sell_target' || result.actionTaken === 'sell_stop' || result.actionTaken === 'sell_signal') {
+        s.dailyTrades += 1;
       }
 
       if (result.guardrailTriggered) {
@@ -240,12 +294,14 @@ export default function App() {
         await saveCurrentSession('guardrail_triggered');
         alert(result.guardrailReason || 'Trava geral acionada.');
       }
+
+      setTick(t => t + 1);
     } finally {
       processingRef.current = false;
     }
   };
 
-  // Replay async loop with processing lock
+  // Replay loop depending ONLY on isRunning (not on currentCandleIndex)
   useEffect(() => {
     let active = true;
     const runLoop = async () => {
@@ -264,7 +320,9 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [isRunning, currentCandleIndex]);
+  }, [isRunning]);
+
+  const s = simRef.current;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -284,22 +342,22 @@ export default function App() {
             onPause={handlePause}
             onStepForward={executeStep}
             onStop={handleStop}
-            wallet={wallet}
-            currentCandleIndex={currentCandleIndex}
-            totalCandles={candles.length}
-            candles={candles}
-            openLots={allLots.filter(l => l.status === 'open')}
-            logs={logs}
-            predictions={predictions}
+            wallet={s.wallet}
+            currentCandleIndex={s.currentCandleIndex}
+            totalCandles={s.candles.length}
+            candles={s.candles}
+            openLots={s.allLots.filter(l => l.status === 'open')}
+            logs={s.logs}
+            predictions={s.predictions}
           />
         )}
 
         {activeTab === 'lots' && (
-          <LotsPanel lots={allLots} />
+          <LotsPanel lots={s.allLots} />
         )}
 
         {activeTab === 'calibration' && (
-          <CalibrationPanel predictions={predictions} />
+          <CalibrationPanel predictions={s.predictions} />
         )}
 
         {activeTab === 'settings' && (
@@ -310,10 +368,11 @@ export default function App() {
           <SessionsPanel
             onLoadSession={(session) => {
               setConfig(session.config);
-              setAllLots(session.lots);
-              setPredictions(session.predictions);
-              setLogs(session.logs);
-              setSessionId(session.id);
+              simRef.current.allLots = session.lots;
+              simRef.current.predictions = session.predictions;
+              simRef.current.logs = session.logs;
+              simRef.current.sessionId = session.id;
+              setTick(t => t + 1);
               setActiveTab('lab');
             }}
             onCompareSessions={(sessionsToCompare) => {

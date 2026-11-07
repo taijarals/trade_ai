@@ -1,6 +1,8 @@
 import Decimal from 'decimal.js';
 import { calculateBuyOrder } from '../src/utils/wallet';
-import { WalletState, Lot } from '../src/types';
+import { processStep } from '../src/utils/engine';
+import { Candle, Config, WalletState, Lot } from '../src/types';
+import { DEFAULT_CONFIG } from '../src/services/storage';
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -10,8 +12,8 @@ function assert(condition: boolean, message: string) {
   console.log(`✅ ${message}`);
 }
 
-function runVerification() {
-  console.log('--- Running Wallet & Replay Verification Tests ---');
+async function runVerification() {
+  console.log('--- Running Wallet & Replay Engine Verification Tests ---');
 
   // Test 1: Required Wallet & Lot Test Case
   const cashBRL = new Decimal(100);
@@ -55,8 +57,32 @@ function runVerification() {
   const expectedProfit = new Decimal(0.394515);
   assert(sellResult.netProfitBRL.minus(expectedProfit).abs().lte(0.001), `Net profit ≈ 0.394 (got ${sellResult.netProfitBRL.toString()})`);
 
-  // Test 2: Replay Test (3 consecutive steps with forced buy)
-  console.log('--- Running Replay 3-Step Forced Buy Test ---');
+  // Test 2: Replay Loop Test with Mock AI (90% High Probability) for 3 Steps
+  console.log('--- Running Replay Loop Test with Mock AI (90% High) ---');
+
+  // Mock global.fetch for AI prediction endpoint
+  (global as any).fetch = async (url: string, options: any) => {
+    if (url.includes('/api/ai/predict')) {
+      return {
+        ok: true,
+        json: async () => ({
+          probabilidadeAlta: 90,
+          justificativa: 'Simulação de alta teste.'
+        })
+      };
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const mockCandles: Candle[] = Array.from({ length: 15 }, (_, i) => ({
+    timestamp: Date.now() + i * 3600000,
+    open: new Decimal(10),
+    high: new Decimal(10.2), // high 10.2 so target 15.0 won't trigger
+    low: new Decimal(9.8),
+    close: new Decimal(10),
+    volume: new Decimal(1000)
+  }));
+
   let wallet: WalletState = {
     cashBRL: new Decimal(100),
     coinQuantity: new Decimal(0),
@@ -66,28 +92,41 @@ function runVerification() {
     totalTrades: 0
   };
 
-  let allLots: Lot[] = [];
+  const testConfig: Config = {
+    ...DEFAULT_CONFIG,
+    buyThreshold: 70,
+    buySizeMode: 'fixed',
+    buySizeValue: 20,
+    maxActiveLots: 5,
+    maxDailyTrades: 10,
+    cooldownSteps: 0,
+    gainTargetPercent: 50, // high target so they don't sell immediately
+    stopLossPercent: null
+  };
 
-  for (let step = 1; step <= 3; step++) {
-    const buyRes = calculateBuyOrder({
-      cashBRL: wallet.cashBRL,
-      amountToSpendBRL: new Decimal(20),
-      currentPrice: new Decimal(10),
-      feePercent: 0.5,
-      slippagePercent: 0,
-      buyProbability: 80,
+  let allLots: Lot[] = [];
+  let predictions: any[] = [];
+  let lastBuyStep = -99;
+
+  for (let step = 5; step <= 7; step++) {
+    const res = await processStep({
       stepIndex: step,
-      gainTargetPercent: 3.0,
-      stopLossPercent: 5.0
+      candles: mockCandles,
+      currentCandleIndex: step,
+      wallet,
+      openLots: allLots.filter(l => l.status === 'open'),
+      allLots,
+      config: testConfig,
+      predictions,
+      sessionId: 'test_session',
+      lastBuyStepIndex: lastBuyStep,
+      initialSessionPrice: new Decimal(10)
     });
 
-    assert(buyRes.success && !!buyRes.lot, `Step ${step} buy order successful`);
-    const newLot = buyRes.lot!;
-    wallet.cashBRL = buyRes.newCashBRL!;
-    wallet.coinQuantity = wallet.coinQuantity.plus(newLot.quantity);
-    wallet.totalFeesPaidBRL = wallet.totalFeesPaidBRL.plus(buyRes.feePaidBRL!);
-    wallet.totalTrades += 1;
-    allLots.push(newLot);
+    wallet = res.updatedWallet;
+    allLots = res.updatedLots;
+    predictions = res.updatedPredictions;
+    if (res.actionTaken === 'buy') lastBuyStep = step;
   }
 
   const openLotsCount = allLots.filter(l => l.status === 'open').length;

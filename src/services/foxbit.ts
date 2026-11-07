@@ -37,7 +37,7 @@ export async function fetchTicker24hr(market: string): Promise<any> {
 }
 
 /**
- * Fetches candlesticks for a market from Foxbit API v3 with pagination and array-of-arrays parsing.
+ * Fetches candlesticks for a market from Foxbit API v3 with pagination, strict validation, and time filtering.
  */
 export async function fetchCandlesticks(
   market: string,
@@ -63,7 +63,6 @@ export async function fetchCandlesticks(
     lastUrl = url;
     lastRawResponse = data;
 
-    // Foxbit v3 candlestick response format: array of arrays or object with data array
     let list: any[] = [];
     if (Array.isArray(data)) {
       list = data;
@@ -87,7 +86,6 @@ export async function fetchCandlesticks(
       let openVal: any, highVal: any, lowVal: any, closeVal: any, volumeVal: any;
 
       if (Array.isArray(item)) {
-        // [timestampAbertura(ms), open, high, low, close, timestampFechamento(ms), volumeBase, volumeCotacao, numeroNegocios, ...]
         timestamp = Number(item[0]);
         openVal = item[1];
         highVal = item[2];
@@ -95,7 +93,6 @@ export async function fetchCandlesticks(
         closeVal = item[4];
         volumeVal = item[6] !== undefined ? item[6] : item[7];
       } else {
-        // Fallback object format
         const timeVal = item.time || item.timestamp || item.t;
         timestamp = typeof timeVal === 'number' ? (timeVal < 10000000000 ? timeVal * 1000 : timeVal) : new Date(timeVal).getTime();
         openVal = item.open !== undefined ? item.open : item.o;
@@ -105,8 +102,9 @@ export async function fetchCandlesticks(
         volumeVal = item.volume !== undefined ? item.volume : item.v;
       }
 
-      if (openVal === undefined || highVal === undefined || lowVal === undefined || closeVal === undefined) {
-        continue;
+      // Strict validation: throw error if missing or invalid
+      if (timestamp === undefined || isNaN(timestamp) || openVal === undefined || highVal === undefined || lowVal === undefined || closeVal === undefined) {
+        throw new Error(`Candle #${i} da Foxbit possui campos ausentes ou inválidos. Conteúdo bruto: ${JSON.stringify(item)}`);
       }
 
       const open = new Decimal(openVal);
@@ -115,8 +113,8 @@ export async function fetchCandlesticks(
       const close = new Decimal(closeVal);
       const volume = new Decimal(volumeVal || 0);
 
-      if (isNaN(open.toNumber()) || isNaN(close.toNumber()) || isNaN(timestamp)) {
-        continue;
+      if (isNaN(open.toNumber()) || isNaN(high.toNumber()) || isNaN(low.toNumber()) || isNaN(close.toNumber())) {
+        throw new Error(`Candle #${i} contém valores numéricos inválidos. Conteúdo bruto: ${JSON.stringify(item)}`);
       }
 
       const isNoTrade = volume.isZero() || (open.eq(high) && high.eq(low) && low.eq(close) && volume.isZero());
@@ -139,27 +137,28 @@ export async function fetchCandlesticks(
 
     fetchedCount = allCandlesMap.size;
 
-    // If endTimeMs is specified and we passed it, break
     if (endTimeMs && batchMaxTimestamp >= endTimeMs) {
       break;
     }
 
-    // If we received fewer items than limit or batchMaxTimestamp didn't advance, stop pagination
-    if (list.length < 50, batchMaxTimestamp === 0 || batchMaxTimestamp <= currentStartTime.getTime()) {
+    if (list.length < 50 || batchMaxTimestamp === 0 || batchMaxTimestamp <= currentStartTime.getTime()) {
       break;
     }
 
-    // Advance start_time to immediately after the last received candle timestamp
     currentStartTime = new Date(batchMaxTimestamp + parseIntervalToMs(interval));
 
-    // Safety guard against infinite loops
     if (list.length < 10) {
       break;
     }
   }
 
-  const candles = Array.from(allCandlesMap.values());
+  let candles = Array.from(allCandlesMap.values());
   candles.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Discard candles with timestamp greater than endTimeMs
+  if (endTimeMs) {
+    candles = candles.filter(c => c.timestamp <= endTimeMs);
+  }
 
   // Fill zero volume / missing trades
   for (let i = 1; i < candles.length; i++) {
