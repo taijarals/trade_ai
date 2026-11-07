@@ -12,6 +12,7 @@ export interface StepExecutionResult {
   guardrailTriggered: boolean;
   guardrailReason?: string;
   actionTaken: 'buy' | 'sell_target' | 'sell_stop' | 'sell_signal' | 'sell_guardrail' | 'wait' | 'guardrail_halt';
+  tradesCountDelta: number; // number of buy/sell actions in this step
 }
 
 export async function processStep({
@@ -25,7 +26,8 @@ export async function processStep({
   predictions,
   sessionId,
   lastBuyStepIndex,
-  initialSessionPrice
+  initialSessionPrice,
+  canOpenTrades = true
 }: {
   stepIndex: number;
   candles: Candle[];
@@ -38,6 +40,7 @@ export async function processStep({
   sessionId: string;
   lastBuyStepIndex: number;
   initialSessionPrice: Decimal;
+  canOpenTrades?: boolean;
 }): Promise<StepExecutionResult> {
   const currentCandle = candles[currentCandleIndex];
   const currentPrice = currentCandle.close;
@@ -47,8 +50,9 @@ export async function processStep({
   let actionTaken: StepExecutionResult['actionTaken'] = 'wait';
   let guardrailTriggered = false;
   let guardrailReason: string | undefined;
+  let tradesCountDelta = 0;
 
-  // 1. Check General Guardrail using initial session price (after warm-up)
+  // 1. Check General Guardrail ALWAYS (even if daily limit is reached)
   const { netWorthBRL } = calculateNetWorth({
     cashBRL: updatedWallet.cashBRL,
     coinQuantity: updatedWallet.coinQuantity,
@@ -85,6 +89,7 @@ export async function processStep({
           updatedWallet.coinQuantity = updatedWallet.coinQuantity.minus(lot.quantity);
           updatedWallet.totalFeesPaidBRL = updatedWallet.totalFeesPaidBRL.plus(sellRes.feeBRL);
           updatedWallet.totalTrades += 1;
+          tradesCountDelta += 1;
 
           const lotIndex = updatedLots.findIndex(l => l.id === lot.id);
           if (lotIndex !== -1) updatedLots[lotIndex] = sellRes.soldLot;
@@ -99,11 +104,12 @@ export async function processStep({
       updatedPredictions: predictions,
       guardrailTriggered: true,
       guardrailReason,
-      actionTaken: 'guardrail_halt'
+      actionTaken: 'guardrail_halt',
+      tradesCountDelta
     };
   }
 
-  // 2. Check open lots against current candle (High / Low / Open)
+  // 2. Check open lots against current candle (High / Low / Open) ALWAYS (even if daily limit reached)
   const newlyClosedOpenLots = openLots.filter(l => l.status === 'open');
   for (const lot of newlyClosedOpenLots) {
     let hitTarget = false;
@@ -143,6 +149,7 @@ export async function processStep({
       updatedWallet.coinQuantity = updatedWallet.coinQuantity.minus(lot.quantity);
       updatedWallet.totalFeesPaidBRL = updatedWallet.totalFeesPaidBRL.plus(sellRes.feeBRL);
       updatedWallet.totalTrades += 1;
+      tradesCountDelta += 1;
 
       const lotIndex = updatedLots.findIndex(l => l.id === lot.id);
       if (lotIndex !== -1) updatedLots[lotIndex] = sellRes.soldLot;
@@ -160,7 +167,7 @@ export async function processStep({
     }
   }
 
-  // 3. Evaluate predictions at every step (Checking if H candles passed)
+  // 3. Evaluate predictions at every step
   const evaluatedPredictions = predictions.map(p => {
     if (!p.evaluated && currentCandleIndex >= p.stepIndex + p.horizon) {
       const futureCandle = candles[p.stepIndex + p.horizon];
@@ -200,7 +207,8 @@ export async function processStep({
       newLogs,
       updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
-      actionTaken: 'wait'
+      actionTaken: 'wait',
+      tradesCountDelta
     };
   }
 
@@ -215,7 +223,8 @@ export async function processStep({
       newLogs,
       updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
-      actionTaken: 'wait'
+      actionTaken: 'wait',
+      tradesCountDelta
     };
   }
 
@@ -242,7 +251,8 @@ export async function processStep({
       newLogs,
       updatedPredictions: evaluatedPredictions,
       guardrailTriggered: false,
-      actionTaken: 'wait'
+      actionTaken: 'wait',
+      tradesCountDelta
     };
   }
 
@@ -262,12 +272,12 @@ export async function processStep({
   };
 
   const allPredsWithNew = [...evaluatedPredictions, predRecord];
-
   const timeStr = new Date(currentCandle.timestamp).toLocaleTimeString();
+
+  // 6. Apply Buy / Sell Signal rules (blocked if canOpenTrades is false)
   const activeOpenLotsCount = updatedLots.filter(l => l.status === 'open').length;
   const cooldownElapsed = stepIndex - lastBuyStepIndex >= config.cooldownSteps;
   const underMaxLots = activeOpenLotsCount < config.maxActiveLots;
-  const underMaxTrades = updatedWallet.totalTrades < config.maxDailyTrades;
 
   let amountToSpend = new Decimal(0);
   if (config.buySizeMode === 'fixed') {
@@ -281,10 +291,10 @@ export async function processStep({
   }
 
   if (
+    canOpenTrades &&
     probabilidadeAlta >= config.buyThreshold &&
     updatedWallet.cashBRL.gte(amountToSpend) &&
     underMaxLots &&
-    underMaxTrades &&
     cooldownElapsed
   ) {
     const buyRes = calculateBuyOrder({
@@ -304,6 +314,7 @@ export async function processStep({
       updatedWallet.coinQuantity = updatedWallet.coinQuantity.plus(buyRes.lot.quantity);
       updatedWallet.totalFeesPaidBRL = updatedWallet.totalFeesPaidBRL.plus(buyRes.feePaidBRL!);
       updatedWallet.totalTrades += 1;
+      tradesCountDelta += 1;
       updatedLots.push(buyRes.lot);
       actionTaken = 'buy';
 
@@ -315,7 +326,11 @@ export async function processStep({
         message: `${timeStr} — IA (${probabilidadeAlta}% alta): COMPROU R$ ${amountToSpend.toDecimalPlaces(2)} (${buyRes.lot.quantity.toDecimalPlaces(4)} a R$ ${buyRes.lot.buyPrice.toDecimalPlaces(2)}). Meta: R$ ${buyRes.lot.targetPrice.toDecimalPlaces(2)}`
       });
     }
-  } else if (probabilidadeQueda >= config.sellThreshold && config.fallPolicy !== 'ignore') {
+  } else if (
+    canOpenTrades &&
+    probabilidadeQueda >= config.sellThreshold &&
+    config.fallPolicy !== 'ignore'
+  ) {
     actionTaken = 'sell_signal';
     const lotsToSell = updatedLots.filter(l => {
       if (l.status !== 'open') return false;
@@ -341,6 +356,7 @@ export async function processStep({
       updatedWallet.coinQuantity = updatedWallet.coinQuantity.minus(lot.quantity);
       updatedWallet.totalFeesPaidBRL = updatedWallet.totalFeesPaidBRL.plus(sellRes.feeBRL);
       updatedWallet.totalTrades += 1;
+      tradesCountDelta += 1;
 
       const idx = updatedLots.findIndex(l => l.id === lot.id);
       if (idx !== -1) updatedLots[idx] = sellRes.soldLot;
@@ -368,9 +384,9 @@ export async function processStep({
     updatedWallet,
     updatedLots,
     newLogs,
-    newPrediction: predRecord,
     updatedPredictions: allPredsWithNew,
     guardrailTriggered: false,
-    actionTaken
+    actionTaken,
+    tradesCountDelta
   };
 }

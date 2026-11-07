@@ -17,10 +17,13 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('lab');
   const [config, setConfig] = useState<Config>(DEFAULT_CONFIG);
   const [isRunning, setIsRunning] = useState(false);
-  const [tick, setTick] = useState(0); // force render trigger
+  const [tick, setTick] = useState(0);
   const [comparedSessions, setComparedSessions] = useState<SessionRecord[] | null>(null);
 
-  // Mandatory simRef holding ALL simulation state
+  // configRef to read latest config during replay
+  const configRef = useRef(config);
+  configRef.current = config;
+
   const simRef = useRef<{
     candles: Candle[];
     currentCandleIndex: number;
@@ -60,7 +63,6 @@ export default function App() {
   const isRunningRef = useRef(false);
   isRunningRef.current = isRunning;
 
-  // Load candles when market or date changes in replay mode
   useEffect(() => {
     if (config.mode === 'replay') {
       loadReplayCandles();
@@ -96,7 +98,6 @@ export default function App() {
       const startIndex = fetched.findIndex(c => c.timestamp >= startDate.getTime());
       const initialIdx = startIndex !== -1 ? startIndex : Math.min(config.candleWindowSize, fetched.length - 1);
 
-      // Count warmup vs day window candles
       const warmupCandlesCount = fetched.slice(0, initialIdx).length;
       const dayWindowCandlesCount = fetched.slice(initialIdx).length;
 
@@ -220,6 +221,8 @@ export default function App() {
 
     try {
       const s = simRef.current;
+      const currentConfig = configRef.current;
+
       if (s.currentCandleIndex >= s.candles.length - 1) {
         setIsRunning(false);
         await saveCurrentSession('completed');
@@ -244,19 +247,16 @@ export default function App() {
       }
       s.lastTradeCalendarDay = brasiliaDateStr;
 
-      // Check daily trade limit using separate dailyTrades counter
-      if (s.dailyTrades >= config.maxDailyTrades) {
+      const canOpenTrades = s.dailyTrades < currentConfig.maxDailyTrades;
+
+      if (!canOpenTrades) {
         s.logs.push({
           id: `log_${Date.now()}_${Math.random()}`,
           timestamp: Date.now(),
           stepIndex: nextIndex,
           type: 'warning',
-          message: `${new Date(currentCandle.timestamp).toLocaleTimeString()} — Limite diário de operações atingido (${s.dailyTrades}/${config.maxDailyTrades}).`
+          message: `${new Date(currentCandle.timestamp).toLocaleTimeString()} — Limite diário de operações atingido (${s.dailyTrades}/${currentConfig.maxDailyTrades}). Novas compras bloqueadas, mas verificando metas, stops e trava geral.`
         });
-        s.currentCandleIndex = nextIndex;
-        setTick(t => t + 1);
-        processingRef.current = false;
-        return;
       }
 
       const openLotsList = s.allLots.filter(l => l.status === 'open');
@@ -268,25 +268,26 @@ export default function App() {
         wallet: s.wallet,
         openLots: openLotsList,
         allLots: s.allLots,
-        config,
+        config: currentConfig,
         predictions: s.predictions,
         sessionId: s.sessionId,
         lastBuyStepIndex: s.lastBuyStepIndex,
-        initialSessionPrice: s.initialSessionPrice
+        initialSessionPrice: s.initialSessionPrice,
+        canOpenTrades
       });
 
-      // Update simRef ONLY after processStep completes
       s.wallet = result.updatedWallet;
       s.allLots = result.updatedLots;
       s.logs = [...s.logs, ...result.newLogs];
       s.predictions = result.updatedPredictions;
       s.currentCandleIndex = nextIndex;
 
+      // Count each trade sold or bought in tradesCountDelta
+      if (result.tradesCountDelta > 0) {
+        s.dailyTrades += result.tradesCountDelta;
+      }
       if (result.actionTaken === 'buy') {
         s.lastBuyStepIndex = nextIndex;
-        s.dailyTrades += 1;
-      } else if (result.actionTaken === 'sell_target' || result.actionTaken === 'sell_stop' || result.actionTaken === 'sell_signal') {
-        s.dailyTrades += 1;
       }
 
       if (result.guardrailTriggered) {
@@ -301,14 +302,13 @@ export default function App() {
     }
   };
 
-  // Replay loop depending ONLY on isRunning (not on currentCandleIndex)
   useEffect(() => {
     let active = true;
     const runLoop = async () => {
       while (isRunningRef.current && active) {
         await executeStep();
         if (isRunningRef.current && active) {
-          await new Promise(r => setTimeout(r, config.replayDelayMs));
+          await new Promise(r => setTimeout(r, configRef.current.replayDelayMs));
         }
       }
     };
